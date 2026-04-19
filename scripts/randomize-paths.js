@@ -4,10 +4,19 @@ const crypto = require("crypto");
 
 const projectRoot = path.resolve(__dirname, "..");
 const appDir = path.join(projectRoot, "app");
-const envPath = path.join(projectRoot, ".env.local");
-const envExamplePath = path.join(projectRoot, ".env.local.example");
+const adminGroupDir = path.join(appDir, "(admin)");
+const envFiles = [
+  path.join(projectRoot, ".env.local"),
+  path.join(projectRoot, ".env.local.example"),
+];
 
-const ENV_KEYS = {
+const canonicalPaths = {
+  admin: "x7k9_2q",
+  superAdmin: "ops-root",
+  api: "api",
+};
+
+const envKeys = {
   admin: "NEXT_PUBLIC_ADMIN_PATH",
   superAdmin: "NEXT_PUBLIC_SUPER_ADMIN_PATH",
   api: "NEXT_PUBLIC_API_PATH",
@@ -17,13 +26,16 @@ function randomHex() {
   return crypto.randomBytes(12).toString("hex");
 }
 
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
 function readEnvFile(filePath) {
   if (!fs.existsSync(filePath)) {
     return { lines: [], values: {} };
   }
 
-  const content = fs.readFileSync(filePath, "utf8");
-  const lines = content.split(/\r?\n/);
+  const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
   const values = {};
 
   for (const line of lines) {
@@ -36,7 +48,7 @@ function readEnvFile(filePath) {
   return { lines, values };
 }
 
-function upsertEnv(filePath, updates) {
+function writeEnvUpdates(filePath, updates) {
   const { lines } = readEnvFile(filePath);
   const nextLines = [...lines];
 
@@ -50,65 +62,19 @@ function upsertEnv(filePath, updates) {
     }
   }
 
-  const normalized = nextLines.filter((line, index, arr) => {
-    if (index === arr.length - 1 && line === "") {
-      return false;
-    }
-    return true;
-  });
-
-  fs.writeFileSync(filePath, `${normalized.join("\n")}\n`, "utf8");
-}
-
-function ensureUniqueName(existingNames, preferredValue) {
-  let value = preferredValue || randomHex();
-  while (existingNames.has(value)) {
-    value = randomHex();
-  }
-  existingNames.add(value);
-  return value;
-}
-
-function listDirectoryNames(dirPath) {
-  if (!fs.existsSync(dirPath)) {
-    return new Set();
-  }
-
-  return new Set(
-    fs
-      .readdirSync(dirPath, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => entry.name),
+  fs.writeFileSync(
+    filePath,
+    `${nextLines.filter((line, index, arr) => !(index === arr.length - 1 && line === "")).join("\n")}\n`,
+    "utf8",
   );
 }
 
-function renameIfPresent(fromPath, toPath, summary) {
-  if (!fs.existsSync(fromPath)) {
-    return;
-  }
-
-  if (fs.existsSync(toPath)) {
-    summary.skipped.push({
-      from: path.relative(projectRoot, fromPath),
-      to: path.relative(projectRoot, toPath),
-      reason: "target-exists",
-    });
-    return;
-  }
-
-  fs.renameSync(fromPath, toPath);
-  summary.renamed.push({
-    from: path.relative(projectRoot, fromPath),
-    to: path.relative(projectRoot, toPath),
-  });
-}
-
-function replaceInSourceFiles(replacements) {
-  const files = [];
+function replaceInFiles(replacements) {
+  const selfPath = path.join(projectRoot, "scripts", "randomize-paths.js");
 
   function walk(dirPath) {
     for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
-      if (entry.name === "node_modules" || entry.name === ".next" || entry.name === ".git") {
+      if (["node_modules", ".next", ".git", ".vercel"].includes(entry.name)) {
         continue;
       }
 
@@ -118,95 +84,126 @@ function replaceInSourceFiles(replacements) {
         continue;
       }
 
-      if (!/\.(js|jsx|ts|tsx|mjs|cjs|json|md|env|txt)$/i.test(entry.name)) {
+      if (fullPath === selfPath) {
         continue;
       }
 
-      files.push(fullPath);
+      if (!/\.(ts|tsx|js|jsx|mjs|cjs|json|md|env)$/i.test(entry.name)) {
+        continue;
+      }
+
+      const original = fs.readFileSync(fullPath, "utf8");
+      let next = original;
+
+      for (const [from, to] of replacements) {
+        next = next.split(from).join(to);
+      }
+
+      if (next !== original) {
+        fs.writeFileSync(fullPath, next, "utf8");
+      }
     }
   }
 
   walk(projectRoot);
+}
 
-  for (const filePath of files) {
-    const original = fs.readFileSync(filePath, "utf8");
-    let next = original;
+function ensureUniqueTarget(preferredValue, taken) {
+  let value = preferredValue || randomHex();
+  while (taken.has(value) || Object.values(canonicalPaths).includes(value)) {
+    value = randomHex();
+  }
+  taken.add(value);
+  return value;
+}
 
-    for (const [from, to] of replacements) {
-      next = next.split(from).join(to);
-    }
+function movePathIfNeeded(sourcePath, targetPath, renamed) {
+  if (!fs.existsSync(sourcePath) || sourcePath === targetPath || fs.existsSync(targetPath)) {
+    return;
+  }
 
-    if (next !== original) {
-      fs.writeFileSync(filePath, next, "utf8");
-    }
+  fs.renameSync(sourcePath, targetPath);
+  renamed.push({
+    from: path.relative(projectRoot, sourcePath),
+    to: path.relative(projectRoot, targetPath),
+  });
+}
+
+function ensureCanonicalScaffolds(existingTargets) {
+  ensureDir(adminGroupDir);
+
+  const adminCanonicalDir = path.join(adminGroupDir, canonicalPaths.admin);
+  const superAdminCanonicalDir = path.join(adminGroupDir, canonicalPaths.superAdmin);
+  const apiCanonicalDir = path.join(appDir, canonicalPaths.api);
+
+  if (!fs.existsSync(adminCanonicalDir) && !fs.existsSync(path.join(adminGroupDir, existingTargets.admin))) {
+    ensureDir(adminCanonicalDir);
+  }
+
+  if (
+    !fs.existsSync(superAdminCanonicalDir) &&
+    !fs.existsSync(path.join(adminGroupDir, existingTargets.superAdmin))
+  ) {
+    ensureDir(superAdminCanonicalDir);
+  }
+
+  if (!fs.existsSync(apiCanonicalDir) && !fs.existsSync(path.join(appDir, existingTargets.api))) {
+    ensureDir(apiCanonicalDir);
   }
 }
 
 function main() {
-  const adminParent = path.join(appDir, "(admin)");
-  const currentEnv = readEnvFile(envPath).values;
-  const currentExampleEnv = readEnvFile(envExamplePath).values;
-  const knownDirNames = new Set([
-    ...listDirectoryNames(adminParent),
-    ...listDirectoryNames(appDir),
-  ]);
-
-  const adminDir = ensureUniqueName(
-    knownDirNames,
-    (currentEnv[ENV_KEYS.admin] || currentExampleEnv[ENV_KEYS.admin] || "").replace(/^\//, ""),
-  );
-  const superAdminDir = ensureUniqueName(
-    knownDirNames,
-    (currentEnv[ENV_KEYS.superAdmin] || currentExampleEnv[ENV_KEYS.superAdmin] || "").replace(/^\//, ""),
-  );
-  const apiDir = ensureUniqueName(
-    knownDirNames,
-    (currentEnv[ENV_KEYS.api] || currentExampleEnv[ENV_KEYS.api] || "").replace(/^\//, ""),
+  const currentEnv = envFiles.map(readEnvFile).reduce(
+    (accumulator, entry) => ({ ...accumulator, ...entry.values }),
+    {},
   );
 
-  const summary = { renamed: [], skipped: [] };
-
-  renameIfPresent(
-    path.join(adminParent, "02fec873a5d7a8960ed880f9"),
-    path.join(adminParent, adminDir),
-    summary,
-  );
-  renameIfPresent(
-    path.join(adminParent, "d3f1ca9b741ec069d8b4a5a1"),
-    path.join(adminParent, superAdminDir),
-    summary,
-  );
-  renameIfPresent(path.join(appDir, "61661349955feb4ef394a123"), path.join(appDir, apiDir), summary);
-
-  const envUpdates = {
-    [ENV_KEYS.admin]: `/${adminDir}`,
-    [ENV_KEYS.superAdmin]: `/${superAdminDir}`,
-    [ENV_KEYS.api]: `/${apiDir}`,
+  const taken = new Set();
+  const targets = {
+    admin: ensureUniqueTarget(currentEnv[envKeys.admin]?.replace(/^\//, ""), taken),
+    superAdmin: ensureUniqueTarget(currentEnv[envKeys.superAdmin]?.replace(/^\//, ""), taken),
+    api: ensureUniqueTarget(currentEnv[envKeys.api]?.replace(/^\//, ""), taken),
   };
 
-  upsertEnv(envPath, envUpdates);
-  upsertEnv(envExamplePath, envUpdates);
+  ensureCanonicalScaffolds(targets);
 
-  replaceInSourceFiles([
-    ["/02fec873a5d7a8960ed880f9", `/${adminDir}`],
-    ["/d3f1ca9b741ec069d8b4a5a1", `/${superAdminDir}`],
-    ["/61661349955feb4ef394a123/", `/${apiDir}/`],
-    ['"02fec873a5d7a8960ed880f9"', `"${adminDir}"`],
-    ['"d3f1ca9b741ec069d8b4a5a1"', `"${superAdminDir}"`],
-    ['"61661349955feb4ef394a123"', `"${apiDir}"`],
-    ["'02fec873a5d7a8960ed880f9'", `'${adminDir}'`],
-    ["'d3f1ca9b741ec069d8b4a5a1'", `'${superAdminDir}'`],
-    ["'61661349955feb4ef394a123'", `'${apiDir}'`],
+  const renamed = [];
+
+  movePathIfNeeded(
+    path.join(adminGroupDir, canonicalPaths.admin),
+    path.join(adminGroupDir, targets.admin),
+    renamed,
+  );
+  movePathIfNeeded(
+    path.join(adminGroupDir, canonicalPaths.superAdmin),
+    path.join(adminGroupDir, targets.superAdmin),
+    renamed,
+  );
+  movePathIfNeeded(path.join(appDir, canonicalPaths.api), path.join(appDir, targets.api), renamed);
+
+  const envUpdates = {
+    [envKeys.admin]: `/${targets.admin}`,
+    [envKeys.superAdmin]: `/${targets.superAdmin}`,
+    [envKeys.api]: `/${targets.api}`,
+  };
+
+  for (const envFile of envFiles) {
+    writeEnvUpdates(envFile, envUpdates);
+  }
+
+  replaceInFiles([
+    ["/x7k9_2q", envUpdates[envKeys.admin]],
+    ["/ops-root", envUpdates[envKeys.superAdmin]],
+    ["/api/", `${envUpdates[envKeys.api]}/`],
   ]);
 
   process.stdout.write(
     `${JSON.stringify(
       {
-        adminPath: envUpdates[ENV_KEYS.admin],
-        superAdminPath: envUpdates[ENV_KEYS.superAdmin],
-        apiPath: envUpdates[ENV_KEYS.api],
-        renamed: summary.renamed,
-        skipped: summary.skipped,
+        adminPath: envUpdates[envKeys.admin],
+        superAdminPath: envUpdates[envKeys.superAdmin],
+        apiPath: envUpdates[envKeys.api],
+        renamed,
       },
       null,
       2,
